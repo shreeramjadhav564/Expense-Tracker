@@ -1,19 +1,16 @@
 import json
 import boto3
 from decimal import Decimal
+import jwt
 
-# AWS clients
 dynamodb = boto3.resource('dynamodb', region_name='ap-south-1')
 sns = boto3.client('sns')
 
-# Tables
 expense_table = dynamodb.Table('ExpenseTracker')
-limit_table = dynamodb.Table('MonthlyBudget')  # This only holds monthly limits
+limit_table = dynamodb.Table('MonthlyBudget')
 
-# SNS Topic ARN
-SNS_TOPIC_ARN = "arn:aws:sns:ap-south-1:209479278354:ExpenseAlertTopic"  # Replace with your actual ARN
+SNS_TOPIC_ARN = "arn:aws:sns:ap-south-1:209479278354:ExpenseAlertTopic"
 
-# CORS headers
 def cors_headers():
     return {
         'Access-Control-Allow-Origin': 'http://expense-tracker-project-1.s3-website.ap-south-1.amazonaws.com',
@@ -21,70 +18,57 @@ def cors_headers():
         'Access-Control-Allow-Methods': '*'
     }
 
+def get_email(event):
+    headers = {k.lower(): v for k, v in event.get('headers', {}).items()}
+    token = headers.get('authorization')
+    if not token:
+        raise Exception("Authorization token is missing")
+    decoded = jwt.decode(token, options={"verify_signature": False})
+    return decoded['email']
+
+
 def lambda_handler(event, context):
-    print("Incoming event:", json.dumps(event))
-
-    method = event.get('httpMethod')
-
-    # Handle missing method
-    if not method:
-        return {
-            'statusCode': 400,
-            'headers': cors_headers(),
-            'body': json.dumps({'error': 'Missing httpMethod'})
-        }
-
-    # Handle preflight
-    if method == 'OPTIONS':
-        return {
-            'statusCode': 200,
-            'headers': cors_headers(),
-            'body': json.dumps({'message': 'CORS preflight success'})
-        }
-
-    # Only allow POST
-    if method != 'POST':
-        return {
-            'statusCode': 405,
-            'headers': cors_headers(),
-            'body': json.dumps({'error': 'Method Not Allowed'})
-        }
-
     try:
+        if event['httpMethod'] == 'OPTIONS':
+            return {'statusCode': 200, 'headers': cors_headers()}
+
+        if event['httpMethod'] != 'POST':
+            return {'statusCode': 405, 'headers': cors_headers(), 'body': json.dumps({'error': 'Method Not Allowed'})}
+
         body = json.loads(event['body'])
+        email = get_email(event)
 
-        expense_id = body['expense_id']
-        amount = Decimal(str(body['amount']))
-        purpose = body['purpose']
-        date = body['date']  # Expected format: YYYY-MM-DD
-        expense_month = date[:7]  # Extract YYYY-MM
+        expense_id = body.get('expense_id')
+        amount = Decimal(str(body.get('amount')))
+        purpose = body.get('purpose')
+        date = body.get('date')
+        month = date[:7]
 
-        # Save the expense
         expense_table.put_item(Item={
+            'user_email': email,
             'expense_id': expense_id,
             'amount': amount,
             'purpose': purpose,
             'date': date
         })
 
-        # Fetch all expenses and calculate total for the month
-        response = expense_table.scan()
-        monthly_expenses = sum(
-            Decimal(e['amount']) for e in response['Items'] if e.get('date', '').startswith(expense_month)
+        # Query user's expenses only
+        response = expense_table.query(
+            KeyConditionExpression=boto3.dynamodb.conditions.Key('user_email').eq(email)
         )
+        monthly_expenses = sum(Decimal(i['amount']) for i in response['Items'] if i['date'].startswith(month))
 
-        # Get limit for the month
-        limit_data = limit_table.get_item(Key={'month': expense_month})
+        # Get monthly limit
+        limit_data = limit_table.get_item(Key={'user_email': email, 'month': month})
         if 'Item' in limit_data:
-            monthly_limit = Decimal(str(limit_data['Item']['limit']))
-            remaining = monthly_limit - monthly_expenses
+            limit = Decimal(str(limit_data['Item']['limit']))
+            remaining = limit - monthly_expenses
 
-            # Send alert if over budget
-            if monthly_expenses > monthly_limit:
+            if monthly_expenses > limit:
                 sns.publish(
                     TopicArn=SNS_TOPIC_ARN,
                     Subject='💸 Budget Limit Exceeded',
-                    Message=f"⚠️ Your expenses for {expense_month} exceeded the limit!\n\nLimit: ₹{monthly_limit}\nTotal: ₹{monthly_expenses}"
+                    Message=f"⚠️ Expenses for {month} exceeded your limit!\nLimit: ₹{limit}\nSpent: ₹{monthly_expenses}"
                 )
 
             return {
@@ -93,12 +77,11 @@ def lambda_handler(event, context):
                 'body': json.dumps({
                     'message': 'Expense saved',
                     'monthly_total': float(monthly_expenses),
-                    'monthly_limit': float(monthly_limit),
+                    'monthly_limit': float(limit),
                     'remaining_budget': float(remaining)
                 })
             }
 
-        # No limit set
         return {
             'statusCode': 200,
             'headers': cors_headers(),
@@ -109,7 +92,6 @@ def lambda_handler(event, context):
         }
 
     except Exception as e:
-        print("Error:", str(e))
         return {
             'statusCode': 500,
             'headers': cors_headers(),
