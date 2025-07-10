@@ -1,50 +1,54 @@
 import json
 import boto3
 from decimal import Decimal
+import jwt
+
+dynamodb = boto3.resource('dynamodb', region_name='ap-south-1')
+expense_table = dynamodb.Table('ExpenseTracker')
+
+def cors_headers():
+    return {
+        'Access-Control-Allow-Origin': 'http://expense-tracker-project-1.s3-website.ap-south-1.amazonaws.com',
+        'Access-Control-Allow-Headers': '*',
+        'Access-Control-Allow-Methods': '*'
+    }
+
+def decimal_serializer(obj):
+    if isinstance(obj, Decimal):
+        return float(obj)
+    raise TypeError
+
+def get_email(event):
+    token = event.get('headers', {}).get('Authorization')
+    if not token:
+        raise Exception("Authorization token is missing")
+    decoded = jwt.decode(token, options={"verify_signature": False})
+    return decoded['email']
 
 def lambda_handler(event, context):
-    print("Received event:", json.dumps(event))
-
-    dynamodb = boto3.resource('dynamodb', region_name='ap-south-1')
-    table = dynamodb.Table('ExpenseTracker')
-
     try:
-        # Scan all items in the table
-        response = table.scan()
-        data = response['Items']
+        if event['httpMethod'] == 'OPTIONS':
+            return {'statusCode': 200, 'headers': cors_headers()}
 
-        # If there are more items, keep paginating
-        while 'LastEvaluatedKey' in response:
-            response = table.scan(ExclusiveStartKey=response['LastEvaluatedKey'])
-            data.extend(response['Items'])
+        if event['httpMethod'] != 'GET':
+            return {'statusCode': 405, 'headers': cors_headers(), 'body': json.dumps({'error': 'Method Not Allowed'})}
 
-        # Optional: Sort by date (descending)
-        data.sort(key=lambda x: str(x.get('date', '')), reverse=True)
+        email = get_email(event)
+
+        response = expense_table.query(
+            KeyConditionExpression=boto3.dynamodb.conditions.Key('user_email').eq(email)
+        )
+        items = sorted(response['Items'], key=lambda x: x.get('date', ''), reverse=True)
 
         return {
             'statusCode': 200,
             'headers': cors_headers(),
-            'body': json.dumps(data, default=decimal_serializer)
+            'body': json.dumps(items, default=decimal_serializer)
         }
 
     except Exception as e:
-        print("Error occurred:", str(e))
         return {
             'statusCode': 500,
             'headers': cors_headers(),
             'body': json.dumps({'error': str(e)})
         }
-
-# Converts Decimal to float
-def decimal_serializer(obj):
-    if isinstance(obj, Decimal):
-        return float(obj)
-    raise TypeError(f"Object of type {type(obj)} is not JSON serializable")
-
-# CORS headers for frontend
-def cors_headers():
-    return {
-        'Access-Control-Allow-Origin': 'http://expense-tracker-project-1.s3-website.ap-south-1.amazonaws.com',
-        'Access-Control-Allow-Methods': 'GET,OPTIONS',
-        'Access-Control-Allow-Headers': 'Content-Type,Authorization'
-    }
